@@ -75,6 +75,11 @@ type PostingsIterator interface {
 	Next() (Posting, error)
 
 	Size() int
+
+	// Advance will return the respective posting by loading
+	// the chunk in which the doc detail resides and calling Next() until
+	// it finds the given doc details.
+	Advance(docNum uint64) (Posting, error)
 }
 
 type Posting interface {
