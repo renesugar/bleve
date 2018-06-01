@@ -39,14 +39,14 @@ var exploreCmd = &cobra.Command{
 
 		addr, err := segment.DictAddr(args[1])
 		if err != nil {
-			return fmt.Errorf("error determing address: %v", err)
+			return fmt.Errorf("error determining address: %v", err)
 		}
 		fmt.Printf("dictionary for field starts at %d (%x)\n", addr, addr)
 
 		vellumLen, read := binary.Uvarint(data[addr : addr+binary.MaxVarintLen64])
 		fmt.Printf("vellum length: %d\n", vellumLen)
 		fstBytes := data[addr+uint64(read) : addr+uint64(read)+vellumLen]
-		fmt.Printf("raw vellum data % x\n", fstBytes)
+		fmt.Printf("raw vellum data:\n % x\n", fstBytes)
 
 		if len(args) >= 3 {
 			if fstBytes != nil {

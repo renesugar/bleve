@@ -24,7 +24,7 @@ import (
 	"github.com/blevesearch/bleve/index"
 )
 
-func buildTestSegmentForDict() (*SegmentBase, error) {
+func buildTestSegmentForDict() (*SegmentBase, uint64, error) {
 	doc := &document.Document{
 		ID: "a",
 		Fields: []document.Field{
@@ -105,7 +105,7 @@ func TestDictionary(t *testing.T) {
 
 	_ = os.RemoveAll("/tmp/scorch.zap")
 
-	testSeg, _ := buildTestSegmentForDict()
+	testSeg, _, _ := buildTestSegmentForDict()
 	err := PersistSegmentBase(testSeg, "/tmp/scorch.zap")
 	if err != nil {
 		t.Fatalf("error persisting segment: %v", err)
@@ -177,4 +177,44 @@ func TestDictionary(t *testing.T) {
 	if !reflect.DeepEqual(expected, got) {
 		t.Errorf("expected: %v, got: %v", expected, got)
 	}
+}
+
+func TestDictionaryError(t *testing.T) {
+
+	_ = os.RemoveAll("/tmp/scorch.zap")
+
+	testSeg, _, _ := buildTestSegmentForDict()
+	err := PersistSegmentBase(testSeg, "/tmp/scorch.zap")
+	if err != nil {
+		t.Fatalf("error persisting segment: %v", err)
+	}
+
+	segment, err := Open("/tmp/scorch.zap")
+	if err != nil {
+		t.Fatalf("error opening segment: %v", err)
+	}
+	defer func() {
+		cerr := segment.Close()
+		if cerr != nil {
+			t.Fatalf("error closing segment: %v", err)
+		}
+	}()
+
+	dict, err := segment.Dictionary("desc")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	itr := dict.FuzzyIterator("summer", 5)
+	if itr == nil {
+		t.Fatalf("got nil itr")
+	}
+	nxt, err := itr.Next()
+	if nxt != nil {
+		t.Fatalf("expected nil next")
+	}
+	if err == nil {
+		t.Fatalf("expected error from iterator")
+	}
+
 }

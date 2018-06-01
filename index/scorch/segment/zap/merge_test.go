@@ -33,13 +33,13 @@ func TestMerge(t *testing.T) {
 	_ = os.RemoveAll("/tmp/scorch2.zap")
 	_ = os.RemoveAll("/tmp/scorch3.zap")
 
-	testSeg, _ := buildTestSegmentMulti()
+	testSeg, _, _ := buildTestSegmentMulti()
 	err := PersistSegmentBase(testSeg, "/tmp/scorch.zap")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	testSeg2, _ := buildTestSegmentMulti2()
+	testSeg2, _, _ := buildTestSegmentMulti2()
 	err = PersistSegmentBase(testSeg2, "/tmp/scorch2.zap")
 	if err != nil {
 		t.Fatal(err)
@@ -120,7 +120,7 @@ func TestMergeWithEmptySegmentsFirst(t *testing.T) {
 func testMergeWithEmptySegments(t *testing.T, before bool, numEmptySegments int) {
 	_ = os.RemoveAll("/tmp/scorch.zap")
 
-	testSeg, _ := buildTestSegmentMulti()
+	testSeg, _, _ := buildTestSegmentMulti()
 	err := PersistSegmentBase(testSeg, "/tmp/scorch.zap")
 	if err != nil {
 		t.Fatal(err)
@@ -147,7 +147,7 @@ func testMergeWithEmptySegments(t *testing.T, before bool, numEmptySegments int)
 
 		_ = os.RemoveAll("/tmp/" + fname)
 
-		emptySegment, _ := AnalysisResultsToSegmentBase([]*index.AnalysisResult{}, 1024)
+		emptySegment, _, _ := AnalysisResultsToSegmentBase([]*index.AnalysisResult{}, 1024)
 		err = PersistSegmentBase(emptySegment, "/tmp/"+fname)
 		if err != nil {
 			t.Fatal(err)
@@ -332,8 +332,8 @@ func compareSegments(a, b *Segment) string {
 						fieldName, next.Term, aplist.Count(), bplist.Count()))
 				}
 
-				apitr := aplist.Iterator(true, true, true)
-				bpitr := bplist.Iterator(true, true, true)
+				apitr := aplist.Iterator(true, true, true, nil)
+				bpitr := bplist.Iterator(true, true, true, nil)
 				if (apitr != nil) != (bpitr != nil) {
 					rv = append(rv, fmt.Sprintf("field %s, term: %s, postingsList.Iterator() results different: %v %v",
 						fieldName, next.Term, apitr, bpitr))
@@ -406,8 +406,8 @@ func compareSegments(a, b *Segment) string {
 						err = a.VisitDocument(apitrn.Number(),
 							func(field string, typ byte, value []byte, pos []uint64) bool {
 								afields[field+"-typ"] = typ
-								afields[field+"-value"] = value
-								afields[field+"-pos"] = pos
+								afields[field+"-value"] = append([]byte(nil), value...)
+								afields[field+"-pos"] = append([]uint64(nil), pos...)
 								return true
 							})
 						if err != nil {
@@ -417,8 +417,8 @@ func compareSegments(a, b *Segment) string {
 						err = b.VisitDocument(bpitrn.Number(),
 							func(field string, typ byte, value []byte, pos []uint64) bool {
 								bfields[field+"-typ"] = typ
-								bfields[field+"-value"] = value
-								bfields[field+"-pos"] = pos
+								bfields[field+"-value"] = append([]byte(nil), value...)
+								bfields[field+"-pos"] = append([]uint64(nil), pos...)
 								return true
 							})
 						if err != nil {
@@ -461,7 +461,7 @@ func testMergeAndDrop(t *testing.T, docsToDrop []*roaring.Bitmap) {
 	_ = os.RemoveAll("/tmp/scorch.zap")
 	_ = os.RemoveAll("/tmp/scorch2.zap")
 
-	testSeg, _ := buildTestSegmentMulti()
+	testSeg, _, _ := buildTestSegmentMulti()
 	err := PersistSegmentBase(testSeg, "/tmp/scorch.zap")
 	if err != nil {
 		t.Fatal(err)
@@ -477,7 +477,7 @@ func testMergeAndDrop(t *testing.T, docsToDrop []*roaring.Bitmap) {
 		}
 	}()
 
-	testSeg2, _ := buildTestSegmentMulti2()
+	testSeg2, _, _ := buildTestSegmentMulti2()
 	err = PersistSegmentBase(testSeg2, "/tmp/scorch2.zap")
 	if err != nil {
 		t.Fatal(err)
@@ -564,7 +564,7 @@ func testMergeWithUpdates(t *testing.T, segmentDocIds [][]string, docsToDrop []*
 
 		_ = os.RemoveAll("/tmp/" + fname)
 
-		testSeg, _ := buildTestSegmentMultiHelper(docIds)
+		testSeg, _, _ := buildTestSegmentMultiHelper(docIds)
 		err := PersistSegmentBase(testSeg, "/tmp/"+fname)
 		if err != nil {
 			t.Fatal(err)
@@ -615,11 +615,11 @@ func testMergeAndDropSegments(t *testing.T, segsToMerge []*Segment, docsToDrop [
 	testMergeWithSelf(t, segm.(*Segment), expectedNumDocs)
 }
 
-func buildTestSegmentMulti2() (*SegmentBase, error) {
+func buildTestSegmentMulti2() (*SegmentBase, uint64, error) {
 	return buildTestSegmentMultiHelper([]string{"c", "d"})
 }
 
-func buildTestSegmentMultiHelper(docIds []string) (*SegmentBase, error) {
+func buildTestSegmentMultiHelper(docIds []string) (*SegmentBase, uint64, error) {
 	doc := &document.Document{
 		ID: "c",
 		Fields: []document.Field{
@@ -785,13 +785,13 @@ func TestMergeBytesWritten(t *testing.T) {
 	_ = os.RemoveAll("/tmp/scorch2.zap")
 	_ = os.RemoveAll("/tmp/scorch3.zap")
 
-	testSeg, _ := buildTestSegmentMulti()
+	testSeg, _, _ := buildTestSegmentMulti()
 	err := PersistSegmentBase(testSeg, "/tmp/scorch.zap")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	testSeg2, _ := buildTestSegmentMulti2()
+	testSeg2, _, _ := buildTestSegmentMulti2()
 	err = PersistSegmentBase(testSeg2, "/tmp/scorch2.zap")
 	if err != nil {
 		t.Fatal(err)

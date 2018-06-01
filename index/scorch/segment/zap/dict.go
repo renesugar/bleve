@@ -15,12 +15,14 @@
 package zap
 
 import (
+	"bytes"
 	"fmt"
 
 	"github.com/RoaringBitmap/roaring"
 	"github.com/blevesearch/bleve/index"
 	"github.com/blevesearch/bleve/index/scorch/segment"
 	"github.com/couchbase/vellum"
+	"github.com/couchbase/vellum/levenshtein"
 	"github.com/couchbase/vellum/regexp"
 )
 
@@ -33,12 +35,21 @@ type Dictionary struct {
 }
 
 // PostingsList returns the postings list for the specified term
-func (d *Dictionary) PostingsList(term string, except *roaring.Bitmap) (segment.PostingsList, error) {
-	return d.postingsList([]byte(term), except, nil)
+func (d *Dictionary) PostingsList(term []byte, except *roaring.Bitmap,
+	prealloc segment.PostingsList) (segment.PostingsList, error) {
+	var preallocPL *PostingsList
+	pl, ok := prealloc.(*PostingsList)
+	if ok && pl != nil {
+		preallocPL = pl
+	}
+	return d.postingsList(term, except, preallocPL)
 }
 
 func (d *Dictionary) postingsList(term []byte, except *roaring.Bitmap, rv *PostingsList) (*PostingsList, error) {
 	if d.fst == nil {
+		if rv == nil || rv == emptyPostingsList {
+			return emptyPostingsList, nil
+		}
 		return d.postingsListInit(rv, except), nil
 	}
 
@@ -47,6 +58,9 @@ func (d *Dictionary) postingsList(term []byte, except *roaring.Bitmap, rv *Posti
 		return nil, fmt.Errorf("vellum err: %v", err)
 	}
 	if !exists {
+		if rv == nil || rv == emptyPostingsList {
+			return emptyPostingsList, nil
+		}
 		return d.postingsListInit(rv, except), nil
 	}
 
@@ -65,7 +79,7 @@ func (d *Dictionary) postingsListFromOffset(postingsOffset uint64, except *roari
 }
 
 func (d *Dictionary) postingsListInit(rv *PostingsList, except *roaring.Bitmap) *PostingsList {
-	if rv == nil {
+	if rv == nil || rv == emptyPostingsList {
 		rv = &PostingsList{}
 	} else {
 		postings := rv.postings
@@ -92,6 +106,8 @@ func (d *Dictionary) Iterator() segment.DictionaryIterator {
 		itr, err := d.fst.Iterator(nil, nil)
 		if err == nil {
 			rv.itr = itr
+		} else if err != nil && err != vellum.ErrIteratorDone {
+			rv.err = err
 		}
 	}
 
@@ -111,7 +127,11 @@ func (d *Dictionary) PrefixIterator(prefix string) segment.DictionaryIterator {
 			itr, err := d.fst.Search(r, nil, nil)
 			if err == nil {
 				rv.itr = itr
+			} else if err != nil && err != vellum.ErrIteratorDone {
+				rv.err = err
 			}
+		} else {
+			rv.err = err
 		}
 	}
 
@@ -137,7 +157,101 @@ func (d *Dictionary) RangeIterator(start, end string) segment.DictionaryIterator
 		itr, err := d.fst.Iterator([]byte(start), endBytes)
 		if err == nil {
 			rv.itr = itr
+		} else if err != nil && err != vellum.ErrIteratorDone {
+			rv.err = err
 		}
+	}
+
+	return rv
+}
+
+// RegexpIterator returns an iterator which only visits terms having the
+// the specified regex
+func (d *Dictionary) RegexpIterator(regex string) segment.DictionaryIterator {
+	rv := &DictionaryIterator{
+		d: d,
+	}
+
+	if d.fst != nil {
+		r, err := regexp.New(regex)
+		if err == nil {
+			itr, err2 := d.fst.Search(r, nil, nil)
+			if err2 == nil {
+				rv.itr = itr
+			} else if err2 != nil && err2 != vellum.ErrIteratorDone {
+				rv.err = err2
+			}
+		} else {
+			rv.err = err
+		}
+	}
+
+	return rv
+}
+
+// FuzzyIterator returns an iterator which only visits terms having the
+// the specified edit/levenshtein distance
+func (d *Dictionary) FuzzyIterator(term string,
+	fuzziness int) segment.DictionaryIterator {
+	rv := &DictionaryIterator{
+		d: d,
+	}
+
+	if d.fst != nil {
+		la, err := levenshtein.New(term, fuzziness)
+		if err == nil {
+			itr, err2 := d.fst.Search(la, nil, nil)
+			if err2 == nil {
+				rv.itr = itr
+			} else if err2 != nil && err2 != vellum.ErrIteratorDone {
+				rv.err = err2
+			}
+		} else {
+			rv.err = err
+		}
+	}
+
+	return rv
+}
+
+func (d *Dictionary) OnlyIterator(onlyTerms [][]byte,
+	includeCount bool) segment.DictionaryIterator {
+
+	rv := &DictionaryIterator{
+		d:         d,
+		omitCount: !includeCount,
+	}
+
+	var buf bytes.Buffer
+	builder, err := vellum.New(&buf, nil)
+	if err != nil {
+		rv.err = err
+		return rv
+	}
+	for _, term := range onlyTerms {
+		err = builder.Insert(term, 0)
+		if err != nil {
+			rv.err = err
+			return rv
+		}
+	}
+	err = builder.Close()
+	if err != nil {
+		rv.err = err
+		return rv
+	}
+
+	onlyFST, err := vellum.Load(buf.Bytes())
+	if err != nil {
+		rv.err = err
+		return rv
+	}
+
+	itr, err := d.fst.Search(onlyFST, nil, nil)
+	if err == nil {
+		rv.itr = itr
+	} else if err != nil && err != vellum.ErrIteratorDone {
+		rv.err = err
 	}
 
 	return rv
@@ -145,28 +259,30 @@ func (d *Dictionary) RangeIterator(start, end string) segment.DictionaryIterator
 
 // DictionaryIterator is an iterator for term dictionary
 type DictionaryIterator struct {
-	d   *Dictionary
-	itr vellum.Iterator
-	err error
-	tmp PostingsList
+	d         *Dictionary
+	itr       vellum.Iterator
+	err       error
+	tmp       PostingsList
+	entry     index.DictEntry
+	omitCount bool
 }
 
 // Next returns the next entry in the dictionary
 func (i *DictionaryIterator) Next() (*index.DictEntry, error) {
-	if i.itr == nil || i.err == vellum.ErrIteratorDone {
-		return nil, nil
-	} else if i.err != nil {
+	if i.err != nil && i.err != vellum.ErrIteratorDone {
 		return nil, i.err
+	} else if i.itr == nil || i.err == vellum.ErrIteratorDone {
+		return nil, nil
 	}
 	term, postingsOffset := i.itr.Current()
-	i.err = i.tmp.read(postingsOffset, i.d)
-	if i.err != nil {
-		return nil, i.err
-	}
-	rv := &index.DictEntry{
-		Term:  string(term),
-		Count: i.tmp.Count(),
+	i.entry.Term = string(term)
+	if !i.omitCount {
+		i.err = i.tmp.read(postingsOffset, i.d)
+		if i.err != nil {
+			return nil, i.err
+		}
+		i.entry.Count = i.tmp.Count()
 	}
 	i.err = i.itr.Next()
-	return rv, nil
+	return &i.entry, nil
 }

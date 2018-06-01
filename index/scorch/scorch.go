@@ -36,7 +36,7 @@ import (
 
 const Name = "scorch"
 
-const Version uint8 = 1
+const Version uint8 = 2
 
 var ErrClosed = fmt.Errorf("scorch closed")
 
@@ -57,8 +57,8 @@ type Scorch struct {
 	nextSnapshotEpoch    uint64
 	eligibleForRemoval   []uint64        // Index snapshot epochs that are safe to GC.
 	ineligibleForRemoval map[string]bool // Filenames that should not be GC'ed yet.
-	numSnapshotsToKeep   int
 
+	numSnapshotsToKeep int
 	closeCh            chan struct{}
 	introductions      chan *segmentIntroduction
 	persists           chan *persistIntroduction
@@ -71,6 +71,19 @@ type Scorch struct {
 
 	onEvent      func(event Event)
 	onAsyncError func(err error)
+
+	iStats internalStats
+}
+
+type internalStats struct {
+	persistEpoch          uint64
+	persistSnapshotSize   uint64
+	mergeEpoch            uint64
+	mergeSnapshotSize     uint64
+	newSegBufBytesAdded   uint64
+	newSegBufBytesRemoved uint64
+	analysisBytesAdded    uint64
+	analysisBytesRemoved  uint64
 }
 
 func NewScorch(storeName string,
@@ -84,7 +97,7 @@ func NewScorch(storeName string,
 		closeCh:              make(chan struct{}),
 		ineligibleForRemoval: map[string]bool{},
 	}
-	rv.root = &IndexSnapshot{parent: rv, refs: 1}
+	rv.root = &IndexSnapshot{parent: rv, refs: 1, creator: "NewScorch"}
 	ro, ok := config["read_only"].(bool)
 	if ok {
 		rv.readOnly = ro
@@ -284,12 +297,17 @@ func (s *Scorch) Batch(batch *index.Batch) (err error) {
 	// wait for analysis result
 	analysisResults := make([]*index.AnalysisResult, int(numUpdates))
 	var itemsDeQueued uint64
+	var totalAnalysisSize int
 	for itemsDeQueued < numUpdates {
 		result := <-resultChan
+		resultSize := result.Size()
+		atomic.AddUint64(&s.iStats.analysisBytesAdded, uint64(resultSize))
+		totalAnalysisSize += resultSize
 		analysisResults[itemsDeQueued] = result
 		itemsDeQueued++
 	}
 	close(resultChan)
+	defer atomic.AddUint64(&s.iStats.analysisBytesRemoved, uint64(totalAnalysisSize))
 
 	atomic.AddUint64(&s.stats.TotAnalysisTime, uint64(time.Since(start)))
 
@@ -299,11 +317,13 @@ func (s *Scorch) Batch(batch *index.Batch) (err error) {
 	s.fireEvent(EventKindBatchIntroductionStart, 0)
 
 	var newSegment segment.Segment
+	var bufBytes uint64
 	if len(analysisResults) > 0 {
-		newSegment, err = zap.AnalysisResultsToSegmentBase(analysisResults, DefaultChunkFactor)
+		newSegment, bufBytes, err = zap.AnalysisResultsToSegmentBase(analysisResults, DefaultChunkFactor)
 		if err != nil {
 			return err
 		}
+		atomic.AddUint64(&s.iStats.newSegBufBytesAdded, bufBytes)
 	} else {
 		atomic.AddUint64(&s.stats.TotBatchesEmpty, 1)
 	}
@@ -321,6 +341,7 @@ func (s *Scorch) Batch(batch *index.Batch) (err error) {
 		atomic.AddUint64(&s.stats.TotIndexedPlainTextBytes, numPlainTextBytes)
 	}
 
+	atomic.AddUint64(&s.iStats.newSegBufBytesRemoved, bufBytes)
 	atomic.AddUint64(&s.stats.TotIndexTime, uint64(time.Since(indexStart)))
 
 	return err
@@ -403,7 +424,9 @@ func (s *Scorch) Reader() (index.IndexReader, error) {
 func (s *Scorch) currentSnapshot() *IndexSnapshot {
 	s.rootLock.RLock()
 	rv := s.root
-	rv.AddRef()
+	if rv != nil {
+		rv.AddRef()
+	}
 	s.rootLock.RUnlock()
 	return rv
 }
@@ -487,12 +510,44 @@ func (s *Scorch) AddEligibleForRemoval(epoch uint64) {
 	s.rootLock.Unlock()
 }
 
-func (s *Scorch) MemoryUsed() uint64 {
+func (s *Scorch) MemoryUsed() (memUsed uint64) {
 	indexSnapshot := s.currentSnapshot()
+	if indexSnapshot == nil {
+		return
+	}
+
 	defer func() {
 		_ = indexSnapshot.Close()
 	}()
-	return uint64(indexSnapshot.Size())
+
+	// Account for current root snapshot overhead
+	memUsed += uint64(indexSnapshot.Size())
+
+	// Account for snapshot that the persister may be working on
+	persistEpoch := atomic.LoadUint64(&s.iStats.persistEpoch)
+	persistSnapshotSize := atomic.LoadUint64(&s.iStats.persistSnapshotSize)
+	if persistEpoch != 0 && indexSnapshot.epoch > persistEpoch {
+		// the snapshot that the persister is working on isn't the same as
+		// the current snapshot
+		memUsed += persistSnapshotSize
+	}
+
+	// Account for snapshot that the merger may be working on
+	mergeEpoch := atomic.LoadUint64(&s.iStats.mergeEpoch)
+	mergeSnapshotSize := atomic.LoadUint64(&s.iStats.mergeSnapshotSize)
+	if mergeEpoch != 0 && indexSnapshot.epoch > mergeEpoch {
+		// the snapshot that the merger is working on isn't the same as
+		// the current snapshot
+		memUsed += mergeSnapshotSize
+	}
+
+	memUsed += (atomic.LoadUint64(&s.iStats.newSegBufBytesAdded) -
+		atomic.LoadUint64(&s.iStats.newSegBufBytesRemoved))
+
+	memUsed += (atomic.LoadUint64(&s.iStats.analysisBytesAdded) -
+		atomic.LoadUint64(&s.iStats.analysisBytesRemoved))
+
+	return memUsed
 }
 
 func (s *Scorch) markIneligibleForRemoval(filename string) {

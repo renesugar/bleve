@@ -16,6 +16,7 @@ package scorch
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -80,6 +81,8 @@ OUTER:
 			ourSnapshot.AddRef()
 			ourPersisted = s.rootPersisted
 			s.rootPersisted = nil
+			atomic.StoreUint64(&s.iStats.persistSnapshotSize, uint64(ourSnapshot.Size()))
+			atomic.StoreUint64(&s.iStats.persistEpoch, ourSnapshot.epoch)
 		}
 		s.rootLock.Unlock()
 
@@ -94,6 +97,7 @@ OUTER:
 				close(ch)
 			}
 			if err != nil {
+				atomic.StoreUint64(&s.iStats.persistEpoch, 0)
 				if err == ErrClosed {
 					// index has been closed
 					_ = ourSnapshot.DecRef()
@@ -104,6 +108,8 @@ OUTER:
 				atomic.AddUint64(&s.stats.TotPersistLoopErr, 1)
 				continue OUTER
 			}
+
+			atomic.StoreUint64(&s.stats.LastPersistedEpoch, ourSnapshot.epoch)
 
 			lastPersistedEpoch = ourSnapshot.epoch
 			for _, ew := range persistWatchers {
@@ -240,7 +246,7 @@ func (s *Scorch) persistSnapshotMaybeMerge(snapshot *IndexSnapshot) (
 		return false, nil
 	}
 
-	_, newSnapshot, newSegmentID, err := s.mergeSegmentBases(
+	newSnapshot, newSegmentID, err := s.mergeSegmentBases(
 		snapshot, sbs, sbsDrops, sbsIndexes, DefaultChunkFactor)
 	if err != nil {
 		return false, err
@@ -265,6 +271,7 @@ func (s *Scorch) persistSnapshotMaybeMerge(snapshot *IndexSnapshot) (
 		segment:  make([]*SegmentSnapshot, 0, len(snapshot.segment)),
 		internal: snapshot.internal,
 		epoch:    snapshot.epoch,
+		creator:  "persistSnapshotMaybeMerge",
 	}
 
 	// copy to the equiv the segments that weren't replaced
@@ -313,6 +320,22 @@ func (s *Scorch) persistSnapshotDirect(snapshot *IndexSnapshot) (err error) {
 	}
 	newSnapshotKey := segment.EncodeUvarintAscending(nil, snapshot.epoch)
 	snapshotBucket, err := snapshotsBucket.CreateBucketIfNotExists(newSnapshotKey)
+	if err != nil {
+		return err
+	}
+
+	// persist meta values
+	metaBucket, err := snapshotBucket.CreateBucketIfNotExists(boltMetaDataKey)
+	if err != nil {
+		return err
+	}
+	err = metaBucket.Put([]byte("type"), []byte(zap.Type))
+	if err != nil {
+		return err
+	}
+	buf := make([]byte, binary.MaxVarintLen32)
+	binary.BigEndian.PutUint32(buf, zap.Version)
+	err = metaBucket.Put([]byte("version"), buf)
 	if err != nil {
 		return err
 	}
@@ -457,6 +480,7 @@ var boltSnapshotsBucket = []byte{'s'}
 var boltPathKey = []byte{'p'}
 var boltDeletedKey = []byte{'d'}
 var boltInternalKey = []byte{'i'}
+var boltMetaDataKey = []byte{'m'}
 
 func (s *Scorch) loadFromBolt() error {
 	return s.rootBolt.View(func(tx *bolt.Tx) error {
@@ -473,19 +497,19 @@ func (s *Scorch) loadFromBolt() error {
 				continue
 			}
 			if foundRoot {
-				s.eligibleForRemoval = append(s.eligibleForRemoval, snapshotEpoch)
+				s.AddEligibleForRemoval(snapshotEpoch)
 				continue
 			}
 			snapshot := snapshots.Bucket(k)
 			if snapshot == nil {
 				log.Printf("snapshot key, but bucket missing %x, continuing", k)
-				s.eligibleForRemoval = append(s.eligibleForRemoval, snapshotEpoch)
+				s.AddEligibleForRemoval(snapshotEpoch)
 				continue
 			}
 			indexSnapshot, err := s.loadSnapshot(snapshot)
 			if err != nil {
 				log.Printf("unable to load snapshot, %v, continuing", err)
-				s.eligibleForRemoval = append(s.eligibleForRemoval, snapshotEpoch)
+				s.AddEligibleForRemoval(snapshotEpoch)
 				continue
 			}
 			indexSnapshot.epoch = snapshotEpoch
@@ -495,8 +519,8 @@ func (s *Scorch) loadFromBolt() error {
 				return err
 			}
 			s.nextSegmentID++
-			s.nextSnapshotEpoch = snapshotEpoch + 1
 			s.rootLock.Lock()
+			s.nextSnapshotEpoch = snapshotEpoch + 1
 			if s.root != nil {
 				_ = s.root.DecRef()
 			}
@@ -536,6 +560,7 @@ func (s *Scorch) loadSnapshot(snapshot *bolt.Bucket) (*IndexSnapshot, error) {
 		parent:   s,
 		internal: make(map[string][]byte),
 		refs:     1,
+		creator:  "loadSnapshot",
 	}
 	var running uint64
 	c := snapshot.Cursor()
@@ -551,7 +576,7 @@ func (s *Scorch) loadSnapshot(snapshot *bolt.Bucket) (*IndexSnapshot, error) {
 				_ = rv.DecRef()
 				return nil, err
 			}
-		} else {
+		} else if k[0] != boltMetaDataKey[0] {
 			segmentBucket := snapshot.Bucket(k)
 			if segmentBucket == nil {
 				_ = rv.DecRef()
@@ -599,7 +624,9 @@ func (s *Scorch) loadSegment(segmentBucket *bolt.Bucket) (*SegmentSnapshot, erro
 			_ = segment.Close()
 			return nil, fmt.Errorf("error reading deleted bytes: %v", err)
 		}
-		rv.deleted = deletedBitmap
+		if !deletedBitmap.IsEmpty() {
+			rv.deleted = deletedBitmap
+		}
 	}
 
 	return rv, nil

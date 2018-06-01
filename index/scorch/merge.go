@@ -15,7 +15,6 @@
 package scorch
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -50,6 +49,8 @@ OUTER:
 			s.rootLock.RLock()
 			ourSnapshot := s.root
 			ourSnapshot.AddRef()
+			atomic.StoreUint64(&s.iStats.mergeSnapshotSize, uint64(ourSnapshot.Size()))
+			atomic.StoreUint64(&s.iStats.mergeEpoch, ourSnapshot.epoch)
 			s.rootLock.RUnlock()
 
 			if ourSnapshot.epoch != lastEpochMergePlanned {
@@ -58,6 +59,7 @@ OUTER:
 				// lets get started
 				err := s.planMergeAtSnapshot(ourSnapshot, mergePlannerOptions)
 				if err != nil {
+					atomic.StoreUint64(&s.iStats.mergeEpoch, 0)
 					if err == ErrClosed {
 						// index has been closed
 						_ = ourSnapshot.DecRef()
@@ -69,6 +71,8 @@ OUTER:
 					continue OUTER
 				}
 				lastEpochMergePlanned = ourSnapshot.epoch
+
+				atomic.StoreUint64(&s.stats.LastMergedEpoch, ourSnapshot.epoch)
 
 				s.fireEvent(EventKindMergerProgress, time.Since(startTime))
 			}
@@ -192,7 +196,7 @@ func (s *Scorch) planMergeAtSnapshot(ourSnapshot *IndexSnapshot,
 			fileMergeZapStartTime := time.Now()
 
 			atomic.AddUint64(&s.stats.TotFileMergeZapBeg, 1)
-			newDocNums, nBytes, err := zap.Merge(segmentsToMerge, docsToDrop, path, 1024)
+			newDocNums, nBytes, err := zap.Merge(segmentsToMerge, docsToDrop, path, DefaultChunkFactor)
 			atomic.AddUint64(&s.stats.TotFileMergeZapEnd, 1)
 			atomic.AddUint64(&s.stats.TotFileMergeWrittenBytes, nBytes)
 
@@ -271,19 +275,20 @@ type segmentMerge struct {
 // into the root
 func (s *Scorch) mergeSegmentBases(snapshot *IndexSnapshot,
 	sbs []*zap.SegmentBase, sbsDrops []*roaring.Bitmap, sbsIndexes []int,
-	chunkFactor uint32) (uint64, *IndexSnapshot, uint64, error) {
+	chunkFactor uint32) (*IndexSnapshot, uint64, error) {
 	atomic.AddUint64(&s.stats.TotMemMergeBeg, 1)
-
-	var br bytes.Buffer
-
-	cr := zap.NewCountHashWriter(&br)
 
 	memMergeZapStartTime := time.Now()
 
 	atomic.AddUint64(&s.stats.TotMemMergeZapBeg, 1)
-	newDocNums, numDocs, storedIndexOffset, fieldsIndexOffset,
-		docValueOffset, dictLocs, fieldsInv, fieldsMap, err :=
-		zap.MergeToWriter(sbs, sbsDrops, chunkFactor, cr)
+
+	newSegmentID := atomic.AddUint64(&s.nextSegmentID, 1)
+	filename := zapFileName(newSegmentID)
+	path := s.path + string(os.PathSeparator) + filename
+
+	newDocNums, _, err :=
+		zap.MergeSegmentBases(sbs, sbsDrops, path, chunkFactor)
+
 	atomic.AddUint64(&s.stats.TotMemMergeZapEnd, 1)
 
 	memMergeZapTime := uint64(time.Since(memMergeZapStartTime))
@@ -294,31 +299,13 @@ func (s *Scorch) mergeSegmentBases(snapshot *IndexSnapshot,
 
 	if err != nil {
 		atomic.AddUint64(&s.stats.TotMemMergeErr, 1)
-		return 0, nil, 0, err
-	}
-
-	sb, err := zap.InitSegmentBase(br.Bytes(), cr.Sum32(), chunkFactor,
-		fieldsMap, fieldsInv, numDocs, storedIndexOffset, fieldsIndexOffset,
-		docValueOffset, dictLocs)
-	if err != nil {
-		atomic.AddUint64(&s.stats.TotMemMergeErr, 1)
-		return 0, nil, 0, err
-	}
-
-	newSegmentID := atomic.AddUint64(&s.nextSegmentID, 1)
-
-	filename := zapFileName(newSegmentID)
-	path := s.path + string(os.PathSeparator) + filename
-	err = zap.PersistSegmentBase(sb, path)
-	if err != nil {
-		atomic.AddUint64(&s.stats.TotMemMergeErr, 1)
-		return 0, nil, 0, err
+		return nil, 0, err
 	}
 
 	segment, err := zap.Open(path)
 	if err != nil {
 		atomic.AddUint64(&s.stats.TotMemMergeErr, 1)
-		return 0, nil, 0, err
+		return nil, 0, err
 	}
 
 	// update persisted stats
@@ -342,16 +329,16 @@ func (s *Scorch) mergeSegmentBases(snapshot *IndexSnapshot,
 	select { // send to introducer
 	case <-s.closeCh:
 		_ = segment.DecRef()
-		return 0, nil, 0, ErrClosed
+		return nil, 0, ErrClosed
 	case s.merges <- sm:
 	}
 
 	select { // wait for introduction to complete
 	case <-s.closeCh:
-		return 0, nil, 0, ErrClosed
+		return nil, 0, ErrClosed
 	case newSnapshot := <-sm.notify:
 		atomic.AddUint64(&s.stats.TotMemMergeSegments, uint64(len(sbs)))
 		atomic.AddUint64(&s.stats.TotMemMergeDone, 1)
-		return numDocs, newSnapshot, newSegmentID, nil
+		return newSnapshot, newSegmentID, nil
 	}
 }

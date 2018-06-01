@@ -28,6 +28,9 @@ type Segment interface {
 	Dictionary(field string) (TermDictionary, error)
 
 	VisitDocument(num uint64, visitor DocumentFieldValueVisitor) error
+
+	DocID(num uint64) ([]byte, error)
+
 	Count() uint64
 
 	DocNumbers([]string) (*roaring.Bitmap, error)
@@ -43,11 +46,14 @@ type Segment interface {
 }
 
 type TermDictionary interface {
-	PostingsList(term string, except *roaring.Bitmap) (PostingsList, error)
+	PostingsList(term []byte, except *roaring.Bitmap, prealloc PostingsList) (PostingsList, error)
 
 	Iterator() DictionaryIterator
 	PrefixIterator(prefix string) DictionaryIterator
 	RangeIterator(start, end string) DictionaryIterator
+	RegexpIterator(regex string) DictionaryIterator
+	FuzzyIterator(term string, fuzziness int) DictionaryIterator
+	OnlyIterator(onlyTerms [][]byte, includeCount bool) DictionaryIterator
 }
 
 type DictionaryIterator interface {
@@ -55,7 +61,7 @@ type DictionaryIterator interface {
 }
 
 type PostingsList interface {
-	Iterator(includeFreq, includeNorm, includeLocations bool) PostingsIterator
+	Iterator(includeFreq, includeNorm, includeLocations bool, prealloc PostingsIterator) PostingsIterator
 
 	Size() int
 
@@ -73,6 +79,12 @@ type PostingsIterator interface {
 	// implementations may return a shared instance to reduce memory
 	// allocations.
 	Next() (Posting, error)
+
+	// Advance will return the posting with the specified doc number
+	// or if there is no such posting, the next posting.
+	// Callers MUST NOT attempt to pass a docNum that is less than or
+	// equal to the currently visited posting doc Num.
+	Advance(docNum uint64) (Posting, error)
 
 	Size() int
 }
@@ -102,10 +114,13 @@ type Location interface {
 // postings or other indexed values.
 type DocumentFieldTermVisitable interface {
 	VisitDocumentFieldTerms(localDocNum uint64, fields []string,
-		visitor index.DocumentFieldTermVisitor) error
+		visitor index.DocumentFieldTermVisitor, optional DocVisitState) (DocVisitState, error)
 
 	// VisitableDocValueFields implementation should return
 	// the list of fields which are document value persisted and
 	// therefore visitable by the above VisitDocumentFieldTerms method.
 	VisitableDocValueFields() ([]string, error)
+}
+
+type DocVisitState interface {
 }
